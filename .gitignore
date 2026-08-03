@@ -1,0 +1,35 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Spring Boot
+application-local.properties
+application-local.yml
+
+# Build
+target/
+build/
+dist/
+
+# Dependencies
+node_modules/
+
+# Eclipse
+.metadata/
+.settings/
+.project
+.classpath
+
+# IntelliJ
+.idea/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
