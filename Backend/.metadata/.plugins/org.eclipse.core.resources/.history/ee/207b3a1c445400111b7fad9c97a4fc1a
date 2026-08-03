@@ -1,0 +1,73 @@
+package com.resumeanalyzer.controller;
+
+import com.resumeanalyzer.model.AnalysisResponse;
+import com.resumeanalyzer.service.GeminiService;
+import com.resumeanalyzer.service.PdfExtractorService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+@RestController
+@RequestMapping("/api/resume")
+public class ResumeController {
+
+    @Autowired
+    private GeminiService geminiService;
+
+    @Autowired
+    private PdfExtractorService pdfExtractorService;
+
+    // Health check
+    @GetMapping("/health")
+    public ResponseEntity<String> health() {
+        return ResponseEntity.ok("AI Resume Analyzer is running!");
+    }
+
+    // Analyze via PDF upload + job description text
+    @PostMapping("/analyze")
+    public ResponseEntity<?> analyzeResume(
+            @RequestParam("resume") MultipartFile resumeFile,
+            @RequestParam("jobDescription") String jobDescription) {
+        try {
+            String resumeText;
+
+            String contentType = resumeFile.getContentType();
+            if (contentType != null && contentType.equals("application/pdf")) {
+                resumeText = pdfExtractorService.extractText(resumeFile);
+            } else {
+                // Treat as plain text file
+                resumeText = new String(resumeFile.getBytes());
+            }
+
+            if (resumeText == null || resumeText.isBlank()) {
+                return ResponseEntity.badRequest().body("Could not extract text from the uploaded file.");
+            }
+
+            if (jobDescription == null || jobDescription.isBlank()) {
+                return ResponseEntity.badRequest().body("Job description cannot be empty.");
+            }
+
+            AnalysisResponse result = geminiService.analyzeResume(resumeText, jobDescription);
+            return ResponseEntity.ok(result);
+
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body("Analysis failed: " + e.getMessage());
+        }
+    }
+
+    // Analyze via plain text (for testing without PDF)
+    @PostMapping("/analyze-text")
+    public ResponseEntity<?> analyzeText(
+            @RequestParam("resumeText") String resumeText,
+            @RequestParam("jobDescription") String jobDescription) {
+        try {
+            AnalysisResponse result = geminiService.analyzeResume(resumeText, jobDescription);
+            return ResponseEntity.ok(result);
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body("Analysis failed: " + e.getMessage());
+        }
+    }
+}

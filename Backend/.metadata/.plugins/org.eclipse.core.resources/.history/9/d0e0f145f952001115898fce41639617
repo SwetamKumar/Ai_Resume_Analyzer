@@ -1,0 +1,13 @@
+spring.application.name=ai-resume-analyzer
+server.port=8081
+
+# Gemini API Key - Replace with your actual key from https://aistudio.google.com/
+gemini.api.key=AIzaSyDvqk3lN4T2_04P2m0ByU0D6-tGKOtrlCc
+
+# File upload settings
+spring.servlet.multipart.enabled=true
+spring.servlet.multipart.max-file-size=5MB
+spring.servlet.multipart.max-request-size=10MB
+
+# Logging
+logging.level.com.resumeanalyzer=DEBUG

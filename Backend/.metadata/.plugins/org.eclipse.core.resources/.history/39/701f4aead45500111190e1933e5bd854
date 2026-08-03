@@ -1,0 +1,209 @@
+package com.resumeanalyzer.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.resumeanalyzer.model.AnalysisResponse;
+import com.resumeanalyzer.model.FixResponse;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.net.URI;
+import java.net.http.*;
+import java.util.*;
+
+@Service
+public class GeminiService {
+
+    @Value("${openrouter.api.key}")
+    private String apiKey;
+
+    private static final String OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+    private static final String MODEL = "openrouter/free";
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    // ─── ANALYZE ────────────────────────────────────────────────────────────────
+
+    public AnalysisResponse analyzeResume(String resumeText, String jobDescription) throws Exception {
+        String prompt = buildAnalyzePrompt(resumeText, jobDescription);
+        String rawResponse = callOpenRouter(prompt);
+        return parseAnalysisResponse(rawResponse);
+    }
+
+    // ─── FIX ────────────────────────────────────────────────────────────────────
+
+    public FixResponse fixResume(String resumeText, String jobDescription,
+                                  List<String> missingSkills, List<String> improvements) throws Exception {
+        String prompt = buildFixPrompt(resumeText, jobDescription, missingSkills, improvements);
+        String rawResponse = callOpenRouter(prompt);
+        return parseFixResponse(rawResponse);
+    }
+
+    // ─── SHARED HTTP CALL ───────────────────────────────────────────────────────
+
+    private String callOpenRouter(String prompt) throws Exception {
+        String requestBody = """
+            {
+              "model": "%s",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "%s"
+                }
+              ]
+            }
+            """.formatted(MODEL, escapeJson(prompt));
+
+        HttpClient client = HttpClient.newHttpClient();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(OPENROUTER_URL))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .header("HTTP-Referer", "http://localhost:5173")
+                .header("X-Title", "AI Resume Analyzer")
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build();
+
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("OpenRouter API error: " + response.statusCode() + " - " + response.body());
+        }
+
+        // Extract the content text from the OpenAI-compatible response
+        JsonNode root = objectMapper.readTree(response.body());
+        String text = root
+                .path("choices").get(0)
+                .path("message")
+                .path("content").asText();
+
+        return text;
+    }
+
+    // ─── PROMPTS ─────────────────────────────────────────────────────────────────
+
+    private String buildAnalyzePrompt(String resumeText, String jobDescription) {
+        return """
+            You are an expert ATS (Applicant Tracking System) and resume coach.
+
+            Analyze the following resume against the job description and respond ONLY in valid JSON format.
+
+            Resume:
+            ---
+            %s
+            ---
+
+            Job Description:
+            ---
+            %s
+            ---
+
+            Respond with EXACTLY this JSON structure (no extra text, no markdown, no backticks):
+            {
+              "matchScore": <integer 0-100>,
+              "summary": "<2-3 sentence overall assessment>",
+              "matchedSkills": ["<skill1>", "<skill2>", ...],
+              "missingSkills": ["<skill1>", "<skill2>", ...],
+              "improvements": ["<actionable tip 1>", "<actionable tip 2>", "<actionable tip 3>"],
+              "verdict": "<one of: Strong Match | Good Match | Needs Work | Poor Match>"
+            }
+            """.formatted(resumeText, jobDescription);
+    }
+
+    private String buildFixPrompt(String resumeText, String jobDescription,
+                                   List<String> missingSkills, List<String> improvements) {
+        String missingStr = String.join(", ", missingSkills);
+        String improvStr  = String.join(" | ", improvements);
+
+        return """
+            You are an expert resume writer and ATS optimization specialist.
+
+            Rewrite the resume below to better match the job description.
+            Apply ALL the following specific changes:
+
+            Missing skills to naturally incorporate: %s
+            Improvements to apply: %s
+
+            RULES:
+            - Keep the candidate's real experience — do NOT invent fake jobs or degrees
+            - Naturally weave missing skills into existing bullet points where relevant
+            - Strengthen weak bullet points using strong action verbs and quantified results
+            - Maintain the original resume structure and sections
+            - Keep it ATS-friendly: no tables, no columns, no special characters
+            - Make it concise — ideally fits one page
+
+            Original Resume:
+            ---
+            %s
+            ---
+
+            Job Description:
+            ---
+            %s
+            ---
+
+            Respond with EXACTLY this JSON structure (no markdown, no backticks, no extra text):
+            {
+              "fixedResumeText": "<the complete rewritten resume as plain text with newlines as \\n>",
+              "changesSummary": "<2-3 sentences describing what was changed and why>"
+            }
+            """.formatted(missingStr, improvStr, resumeText, jobDescription);
+    }
+
+    // ─── PARSERS ──────────────────────────────────────────────────────────────────
+
+    private AnalysisResponse parseAnalysisResponse(String text) throws Exception {
+        text = stripCodeBlocks(text);
+
+        JsonNode result = objectMapper.readTree(text);
+
+        AnalysisResponse response = new AnalysisResponse();
+        response.setMatchScore(result.path("matchScore").asInt());
+        response.setSummary(result.path("summary").asText());
+        response.setVerdict(result.path("verdict").asText());
+
+        List<String> matched = new ArrayList<>();
+        result.path("matchedSkills").forEach(n -> matched.add(n.asText()));
+        response.setMatchedSkills(matched);
+
+        List<String> missing = new ArrayList<>();
+        result.path("missingSkills").forEach(n -> missing.add(n.asText()));
+        response.setMissingSkills(missing);
+
+        List<String> improvements = new ArrayList<>();
+        result.path("improvements").forEach(n -> improvements.add(n.asText()));
+        response.setImprovements(improvements);
+
+        return response;
+    }
+
+    private FixResponse parseFixResponse(String text) throws Exception {
+        text = stripCodeBlocks(text);
+
+        JsonNode result = objectMapper.readTree(text);
+
+        FixResponse response = new FixResponse();
+        response.setFixedResumeText(result.path("fixedResumeText").asText());
+        response.setChangesSummary(result.path("changesSummary").asText());
+
+        return response;
+    }
+
+    private String stripCodeBlocks(String text) {
+        text = text.replaceAll("```json", "").replaceAll("```", "").trim();
+        int start = text.indexOf('{');
+        int end   = text.lastIndexOf('}');
+        if (start != -1 && end != -1) {
+            text = text.substring(start, end + 1);
+        }
+        return text;
+    }
+
+    private String escapeJson(String text) {
+        return text.replace("\\", "\\\\")
+                   .replace("\"", "\\\"")
+                   .replace("\n", "\\n")
+                   .replace("\r", "\\r")
+                   .replace("\t", "\\t");
+    }
+}

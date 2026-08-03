@@ -1,0 +1,308 @@
+package com.resumeanalyzer.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.resumeanalyzer.model.AnalysisResponse;
+import com.resumeanalyzer.model.FixResponse;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.net.URI;
+import java.net.http.*;
+import java.util.*;
+import java.util.regex.*;
+
+@Service
+public class GeminiService {
+
+    @Value("${openrouter.api.key}")
+    private String apiKey;
+
+    private static final String OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+    private static final String MODEL = "openrouter/free";
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    // ─── ANALYZE ─────────────────────────────────────────────────────────────
+
+    public AnalysisResponse analyzeResume(String resumeText, String jobDescription) throws Exception {
+        String prompt = buildAnalyzePrompt(resumeText, jobDescription);
+        String raw = callOpenRouter(prompt);
+        return parseAnalysisResponse(raw);
+    }
+
+    // ─── FIX ─────────────────────────────────────────────────────────────────
+
+    public FixResponse fixResume(String resumeText, String jobDescription,
+                                  List<String> missingSkills, List<String> improvements) throws Exception {
+        String shortResume = resumeText.length() > 2000
+            ? resumeText.substring(0, 2000) + "\n[truncated]"
+            : resumeText;
+        String shortJd = jobDescription.length() > 800
+            ? jobDescription.substring(0, 800) + "..."
+            : jobDescription;
+
+        String prompt = buildFixPrompt(shortResume, shortJd, missingSkills, improvements);
+        String raw = callOpenRouter(prompt);
+        return parseFixResponse(raw, resumeText);
+    }
+
+    // ─── SHARED HTTP CALL ─────────────────────────────────────────────────────
+
+    private String callOpenRouter(String prompt) throws Exception {
+        String requestBody = """
+            {
+              "model": "%s",
+              "max_tokens": 1500,
+              "messages": [{"role":"user","content":"%s"}]
+            }
+            """.formatted(MODEL, escapeJson(prompt));
+
+        HttpClient client = HttpClient.newHttpClient();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(OPENROUTER_URL))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .header("HTTP-Referer", "http://localhost:5173")
+                .header("X-Title", "AI Resume Analyzer")
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build();
+
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("OpenRouter API error: " + response.statusCode() + " - " + response.body());
+        }
+
+        JsonNode root = objectMapper.readTree(response.body());
+        return root.path("choices").get(0).path("message").path("content").asText();
+    }
+
+    // ─── PROMPTS ─────────────────────────────────────────────────────────────
+
+    private String buildAnalyzePrompt(String resumeText, String jd) {
+        return """
+            You are an ATS resume coach. Analyze the resume against the job description.
+            
+            IMPORTANT: Reply ONLY with a valid JSON object. No markdown. No backticks. No extra text before or after.
+            Use ONLY double quotes for all keys and string values. No equals signs. No single quotes.
+            
+            Required JSON format (copy this structure exactly):
+            {
+              "matchScore": 75,
+              "summary": "Your 2 sentence summary here.",
+              "matchedSkills": ["Java", "Spring Boot"],
+              "missingSkills": ["Docker", "Kubernetes"],
+              "improvements": ["Tip one here", "Tip two here", "Tip three here"],
+              "verdict": "Good Match"
+            }
+            
+            verdict must be exactly one of: Strong Match, Good Match, Needs Work, Poor Match
+            
+            Resume:
+            %s
+            
+            Job Description:
+            %s
+            """.formatted(resumeText, jd);
+    }
+
+    private String buildFixPrompt(String resumeText, String jd,
+                                   List<String> missingSkills, List<String> improvements) {
+        return """
+            You are a professional resume writer. Rewrite the resume to better match the job.
+            Rules: keep real experience, add missing skills naturally, use action verbs, plain text only.
+            
+            Missing skills to add: %s
+            Improvements to apply: %s
+            
+            IMPORTANT: Reply ONLY with a valid JSON object. No markdown. No backticks. No extra text.
+            Use ONLY double quotes. Encode all newlines as \\n inside string values.
+            
+            Required JSON format (copy this structure exactly):
+            {
+              "fixedResumeText": "Full rewritten resume here with \\n for line breaks",
+              "changesSummary": "One or two sentences describing what changed."
+            }
+            
+            Resume to rewrite:
+            %s
+            
+            Job Description:
+            %s
+            """.formatted(
+                String.join(", ", missingSkills),
+                String.join(". ", improvements),
+                resumeText, jd);
+    }
+
+    // ─── PARSERS ─────────────────────────────────────────────────────────────
+
+    private AnalysisResponse parseAnalysisResponse(String raw) throws Exception {
+        String text = aggressiveJsonClean(raw);
+
+        // Fix common AI mistakes before parsing
+        text = fixCommonJsonErrors(text);
+
+        JsonNode result;
+        try {
+            result = objectMapper.readTree(text);
+        } catch (Exception e) {
+            // Last resort: extract fields with regex
+            return extractAnalysisWithRegex(raw);
+        }
+
+        AnalysisResponse r = new AnalysisResponse();
+        r.setMatchScore(result.path("matchScore").asInt(50));
+        r.setSummary(result.path("summary").asText("Analysis complete."));
+
+        // Normalize verdict — AI sometimes returns combined strings like "Strong Match|Good Match"
+        String verdict = result.path("verdict").asText("Good Match");
+        r.setVerdict(normalizeVerdict(verdict));
+
+        List<String> matched = new ArrayList<>();
+        JsonNode matchedNode = result.path("matchedSkills");
+        if (matchedNode.isArray()) {
+            matchedNode.forEach(n -> {
+                // AI sometimes puts all skills in one string — split them
+                String[] parts = n.asText().split(",");
+                for (String p : parts) if (!p.trim().isEmpty()) matched.add(p.trim());
+            });
+        }
+        r.setMatchedSkills(matched);
+
+        List<String> missing = new ArrayList<>();
+        JsonNode missingNode = result.path("missingSkills");
+        if (missingNode.isArray()) {
+            missingNode.forEach(n -> {
+                String[] parts = n.asText().split(",");
+                for (String p : parts) if (!p.trim().isEmpty()) missing.add(p.trim());
+            });
+        }
+        r.setMissingSkills(missing);
+
+        List<String> improvements = new ArrayList<>();
+        result.path("improvements").forEach(n -> improvements.add(n.asText()));
+        r.setImprovements(improvements);
+
+        return r;
+    }
+
+    private FixResponse parseFixResponse(String raw, String originalText) {
+        FixResponse r = new FixResponse();
+        try {
+            String text = aggressiveJsonClean(raw);
+            text = fixCommonJsonErrors(text);
+            JsonNode result = objectMapper.readTree(text);
+            String fixed = result.path("fixedResumeText").asText("");
+            // Convert literal \n sequences to real newlines
+            fixed = fixed.replace("\\n", "\n").replace("\\t", "\t").trim();
+            r.setFixedResumeText(fixed.isBlank() ? originalText : fixed);
+            r.setChangesSummary(result.path("changesSummary").asText("Resume has been optimized."));
+        } catch (Exception e) {
+            // If JSON fails entirely, try to extract the resume text from raw response
+            String extracted = extractFixedTextFallback(raw);
+            r.setFixedResumeText(extracted.isBlank() ? originalText : extracted);
+            r.setChangesSummary("Resume has been optimized with missing skills and improvements applied.");
+        }
+        return r;
+    }
+
+    // ─── JSON REPAIR HELPERS ──────────────────────────────────────────────────
+
+    /**
+     * Strips code fences, finds the outermost { }, trims garbage around it.
+     */
+    private String aggressiveJsonClean(String text) {
+        text = text.replaceAll("(?i)```json", "").replaceAll("```", "").trim();
+        int start = text.indexOf('{');
+        int end   = text.lastIndexOf('}');
+        if (start != -1 && end != -1 && end > start) {
+            text = text.substring(start, end + 1);
+        }
+        return text.trim();
+    }
+
+    /**
+     * Fixes the most common AI JSON mistakes:
+     *  - _key= instead of "key":
+     *  - verdict "A|B" → take first
+     *  - trailing commas
+     *  - single quotes around values
+     */
+    private String fixCommonJsonErrors(String text) {
+        // Fix _key= patterns (e.g., _summary="...")  →  "summary":
+        text = text.replaceAll("_([a-zA-Z]+)\\s*=\\s*", "\"$1\":");
+
+        // Fix missing quotes around keys: word: → "word":
+        text = text.replaceAll("(?<![\"\\w])([a-zA-Z][a-zA-Z0-9]*)\\s*:", "\"$1\":");
+
+        // Fix double-quoted keys (from above fix applied twice): ""key"" → "key"
+        text = text.replaceAll("\"\"([^\"]+)\"\"\\s*:", "\"$1\":");
+
+        // Fix verdict "A|B" — take just the first option
+        text = text.replaceAll("\"(Strong Match|Good Match|Needs Work|Poor Match)\\|[^\"]*\"",
+                               "\"$1\"");
+
+        // Remove trailing commas before } or ]
+        text = text.replaceAll(",\\s*([}\\]])", "$1");
+
+        return text;
+    }
+
+    private String normalizeVerdict(String raw) {
+        if (raw.contains("Strong")) return "Strong Match";
+        if (raw.contains("Good"))   return "Good Match";
+        if (raw.contains("Needs"))  return "Needs Work";
+        if (raw.contains("Poor"))   return "Poor Match";
+        return "Good Match";
+    }
+
+    /**
+     * Last-resort regex extraction when JSON is too broken to parse.
+     */
+    private AnalysisResponse extractAnalysisWithRegex(String raw) {
+        AnalysisResponse r = new AnalysisResponse();
+
+        // matchScore
+        Matcher scoreMatcher = Pattern.compile("matchScore[\"\\s:=]+([0-9]+)").matcher(raw);
+        r.setMatchScore(scoreMatcher.find() ? Integer.parseInt(scoreMatcher.group(1)) : 60);
+
+        // summary
+        Matcher sumMatcher = Pattern.compile("summary[\"\\s:=]+[\"']([^\"']+)[\"']").matcher(raw);
+        r.setSummary(sumMatcher.find() ? sumMatcher.group(1) : "Analysis complete.");
+
+        // verdict
+        Matcher verdMatcher = Pattern.compile("(Strong Match|Good Match|Needs Work|Poor Match)").matcher(raw);
+        r.setVerdict(verdMatcher.find() ? verdMatcher.group(1) : "Good Match");
+
+        r.setMatchedSkills(List.of("See full resume for details"));
+        r.setMissingSkills(List.of("Could not parse — please retry"));
+        r.setImprovements(List.of("Please retry analysis for detailed tips"));
+        return r;
+    }
+
+    /**
+     * If fix JSON is broken, try to pull plain text resume from the raw response.
+     */
+    private String extractFixedTextFallback(String raw) {
+        // Try to find fixedResumeText value with regex
+        Matcher m = Pattern.compile("fixedResumeText[\"\\s:=]+[\"']([^\"']{50,})[\"']",
+                                     Pattern.DOTALL).matcher(raw);
+        if (m.find()) return m.group(1).replace("\\n", "\n");
+
+        // If nothing found, return cleaned raw text
+        String cleaned = raw.replaceAll("```[a-z]*", "").replaceAll("```", "").trim();
+        return cleaned.length() > 100 ? cleaned : "";
+    }
+
+    // ─── ESCAPE ───────────────────────────────────────────────────────────────
+
+    private String escapeJson(String text) {
+        return text.replace("\\", "\\\\")
+                   .replace("\"", "\\\"")
+                   .replace("\n", "\\n")
+                   .replace("\r", "\\r")
+                   .replace("\t", "\\t");
+    }
+}

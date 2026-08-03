@@ -1,0 +1,183 @@
+package com.resumeanalyzer.service;
+
+import org.apache.pdfbox.pdmodel.*;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.*;
+import org.springframework.stereotype.Service;
+
+import java.io.*;
+import java.util.*;
+
+@Service
+public class ResumePdfService {
+
+    private static final float MARGIN       = 50f;
+    private static final float FONT_SIZE    = 10.5f;
+    private static final float HEADING_SIZE = 13f;
+    private static final float LINE_HEIGHT  = 15f;
+    private static final float PAGE_WIDTH   = PDRectangle.A4.getWidth();
+    private static final float PAGE_HEIGHT  = PDRectangle.A4.getHeight();
+    private static final float USABLE_WIDTH = PAGE_WIDTH - 2 * MARGIN;
+
+    public byte[] generateResumePdf(String resumeText, String candidateName) throws IOException {
+
+        try (PDDocument doc = new PDDocument();
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+
+            PDFont boldFont   = new PDType1Font(Standard14Fonts.FontName.HELVETICA_BOLD);
+            PDFont normalFont = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
+
+            // Split the resume into lines for rendering
+            String[] rawLines = resumeText.split("\n");
+            List<String> wrappedLines = new ArrayList<>();
+
+            for (String line : rawLines) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty()) {
+                    wrappedLines.add(""); // blank spacer
+                    continue;
+                }
+                // Word-wrap long lines
+                List<String> wrapped = wrapLine(trimmed, normalFont, FONT_SIZE, USABLE_WIDTH);
+                wrappedLines.addAll(wrapped);
+            }
+
+            // Paginate lines
+            float y = PAGE_HEIGHT - MARGIN;
+            PDPage page = new PDPage(PDRectangle.A4);
+            doc.addPage(page);
+            PDPageContentStream cs = new PDPageContentStream(doc, page);
+
+            // ── Header bar ──────────────────────────────────────────────
+            cs.setNonStrokingColor(0.1f, 0.1f, 0.15f); // dark navy
+            cs.addRect(0, PAGE_HEIGHT - 70, PAGE_WIDTH, 70);
+            cs.fill();
+
+            // Candidate name in header
+            cs.beginText();
+            cs.setFont(boldFont, 18);
+            cs.setNonStrokingColor(1f, 1f, 1f); // white
+            cs.newLineAtOffset(MARGIN, PAGE_HEIGHT - 42);
+            String name = (candidateName != null && !candidateName.isBlank()) ? candidateName : "Resume";
+            cs.showText(name);
+            cs.endText();
+
+            // "AI Optimized" tag
+            cs.beginText();
+            cs.setFont(normalFont, 8);
+            cs.setNonStrokingColor(0.6f, 0.8f, 1f);
+            cs.newLineAtOffset(MARGIN, PAGE_HEIGHT - 58);
+            cs.showText("✦ AI Optimized by ResumeAI");
+            cs.endText();
+
+            y = PAGE_HEIGHT - 85;
+
+            // ── Body content ─────────────────────────────────────────────
+            cs.setNonStrokingColor(0f, 0f, 0f);
+
+            for (String line : wrappedLines) {
+                // New page if needed
+                if (y < MARGIN + LINE_HEIGHT) {
+                    cs.close();
+                    page = new PDPage(PDRectangle.A4);
+                    doc.addPage(page);
+                    cs = new PDPageContentStream(doc, page);
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    y = PAGE_HEIGHT - MARGIN;
+                }
+
+                if (line.isEmpty()) {
+                    y -= LINE_HEIGHT * 0.6f;
+                    continue;
+                }
+
+                boolean isHeading = isSectionHeading(line);
+
+                if (isHeading) {
+                    y -= 4; // extra space before heading
+                    // Draw underline
+                    cs.setStrokingColor(0.43f, 0.43f, 0.98f); // accent purple
+                    cs.setLineWidth(0.8f);
+                    cs.moveTo(MARGIN, y - 2);
+                    cs.lineTo(MARGIN + USABLE_WIDTH, y - 2);
+                    cs.stroke();
+
+                    cs.beginText();
+                    cs.setFont(boldFont, HEADING_SIZE);
+                    cs.setNonStrokingColor(0.1f, 0.1f, 0.4f);
+                    cs.newLineAtOffset(MARGIN, y);
+                    cs.showText(line.toUpperCase());
+                    cs.endText();
+                    cs.setNonStrokingColor(0f, 0f, 0f);
+                    y -= HEADING_SIZE + 6;
+
+                } else if (line.startsWith("•") || line.startsWith("-")) {
+                    cs.beginText();
+                    cs.setFont(normalFont, FONT_SIZE);
+                    cs.newLineAtOffset(MARGIN + 10, y);
+                    cs.showText(cleanText(line));
+                    cs.endText();
+                    y -= LINE_HEIGHT;
+
+                } else {
+                    cs.beginText();
+                    cs.setFont(normalFont, FONT_SIZE);
+                    cs.newLineAtOffset(MARGIN, y);
+                    cs.showText(cleanText(line));
+                    cs.endText();
+                    y -= LINE_HEIGHT;
+                }
+            }
+
+            // Footer on last page
+            cs.setNonStrokingColor(0.6f, 0.6f, 0.6f);
+            cs.beginText();
+            cs.setFont(normalFont, 7.5f);
+            cs.newLineAtOffset(MARGIN, MARGIN - 20);
+            cs.showText("Generated by AI Resume Analyzer · " + java.time.LocalDate.now());
+            cs.endText();
+
+            cs.close();
+            doc.save(out);
+            return out.toByteArray();
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private boolean isSectionHeading(String line) {
+        String upper = line.trim().toUpperCase();
+        return upper.equals("EDUCATION") || upper.equals("EXPERIENCE") ||
+               upper.equals("SKILLS") || upper.equals("PROJECTS") ||
+               upper.equals("CERTIFICATIONS") || upper.equals("SUMMARY") ||
+               upper.equals("OBJECTIVE") || upper.equals("ACHIEVEMENTS") ||
+               upper.equals("WORK EXPERIENCE") || upper.equals("TECHNICAL SKILLS") ||
+               upper.equals("INTERNSHIPS") || upper.equals("CONTACT") ||
+               (line.endsWith(":") && line.length() < 30 && !line.contains("."));
+    }
+
+    private List<String> wrapLine(String text, PDFont font, float fontSize, float maxWidth) throws IOException {
+        List<String> lines = new ArrayList<>();
+        String[] words = text.split(" ");
+        StringBuilder current = new StringBuilder();
+
+        for (String word : words) {
+            String test = current.isEmpty() ? word : current + " " + word;
+            float width = font.getStringWidth(cleanText(test)) / 1000 * fontSize;
+            if (width > maxWidth && !current.isEmpty()) {
+                lines.add(current.toString());
+                current = new StringBuilder(word);
+            } else {
+                if (!current.isEmpty()) current.append(" ");
+                current.append(word);
+            }
+        }
+        if (!current.isEmpty()) lines.add(current.toString());
+        return lines;
+    }
+
+    // Remove characters PDFBox standard fonts can't render
+    private String cleanText(String text) {
+        return text.replaceAll("[^\\x20-\\x7E]", "").trim();
+    }
+}

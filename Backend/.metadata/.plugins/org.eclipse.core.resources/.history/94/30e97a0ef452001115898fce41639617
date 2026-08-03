@@ -1,0 +1,5 @@
+package com.resumeanalyzer.config;
+
+public class CorsConfig {
+
+}

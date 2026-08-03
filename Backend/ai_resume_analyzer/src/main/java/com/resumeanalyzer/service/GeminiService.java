@@ -1,0 +1,309 @@
+package com.resumeanalyzer.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.resumeanalyzer.model.AnalysisResponse;
+import com.resumeanalyzer.model.FixResponse;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.net.URI;
+import java.net.http.*;
+import java.util.*;
+import java.util.regex.*;
+
+@Service
+public class GeminiService {
+
+    @Value("${openrouter.api.key}")
+    private String apiKey;
+
+    private static final String OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+    private static final String MODEL = "openrouter/free";
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    // ─── ANALYZE ─────────────────────────────────────────────────────────────
+
+    public AnalysisResponse analyzeResume(String resumeText, String jobDescription) throws Exception {
+        String prompt = buildAnalyzePrompt(resumeText, jobDescription);
+        String raw = callOpenRouter(prompt, 2000);
+        System.out.println("=== RAW ANALYZE RESPONSE ===\n" + raw + "\n===========================");
+        return parseAnalysisResponse(raw);
+    }
+
+    // ─── FIX ─────────────────────────────────────────────────────────────────
+
+    public FixResponse fixResume(String resumeText, String jobDescription,
+                                  List<String> missingSkills, List<String> improvements) throws Exception {
+        // FIX 1: Increased truncation limit from 2500 → 4000 chars,
+        // and cut at a line boundary to avoid feeding the AI a mid-sentence fragment.
+        String shortResume = resumeText;
+        if (resumeText.length() > 4000) {
+            shortResume = resumeText.substring(0, 4000);
+            int lastNewline = shortResume.lastIndexOf('\n');
+            if (lastNewline > 2000) {
+                shortResume = shortResume.substring(0, lastNewline);
+            }
+        }
+
+        String shortJd = jobDescription.length() > 800
+            ? jobDescription.substring(0, 800) : jobDescription;
+
+        String prompt = buildFixPrompt(shortResume, shortJd, missingSkills, improvements);
+        // FIX 2: Use 3500 max_tokens for fix calls — a full resume rewrite
+        // easily exceeds the old 2000-token cap, causing truncated/invalid JSON.
+        String raw = callOpenRouter(prompt, 3500);
+        System.out.println("=== RAW FIX RESPONSE ===\n" + raw + "\n========================");
+        return parseFixResponse(raw, resumeText);
+    }
+
+    // ─── HTTP ─────────────────────────────────────────────────────────────────
+
+    // FIX 3: Accept maxTokens as a parameter so analyze and fix can use different limits.
+    private String callOpenRouter(String prompt, int maxTokens) throws Exception {
+        String requestBody = objectMapper.writeValueAsString(Map.of(
+            "model", MODEL,
+            "max_tokens", maxTokens,
+            "messages", List.of(Map.of("role", "user", "content", prompt))
+        ));
+
+        HttpClient client = HttpClient.newHttpClient();
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(OPENROUTER_URL))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .header("HTTP-Referer", "http://localhost:5173")
+                .header("X-Title", "AI Resume Analyzer")
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build();
+
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("OpenRouter API error: " + response.statusCode() + " - " + response.body());
+        }
+
+        JsonNode root = objectMapper.readTree(response.body());
+        return root.path("choices").get(0).path("message").path("content").asText();
+    }
+
+    // ─── PROMPTS ─────────────────────────────────────────────────────────────
+
+    private String buildAnalyzePrompt(String resumeText, String jd) {
+        return "You are an ATS resume coach. Carefully read the resume and job description below, then analyze how well the resume matches the job.\n\n" +
+               "You MUST respond with ONLY a JSON object. No explanation. No markdown. No code blocks. Start your response with { and end with }.\n\n" +
+               "Use this EXACT structure:\n" +
+               "{\n" +
+               "  \"matchScore\": 72,\n" +
+               "  \"summary\": \"Write 2 sentences here about how well the resume matches.\",\n" +
+               "  \"matchedSkills\": [\"Java\", \"Spring Boot\", \"MySQL\"],\n" +
+               "  \"missingSkills\": [\"Docker\", \"Kubernetes\", \"AWS\"],\n" +
+               "  \"improvements\": [\"Add quantified metrics to experience bullets\", \"Include Docker usage in projects section\", \"Mention cloud deployment experience\"],\n" +
+               "  \"verdict\": \"Good Match\"\n" +
+               "}\n\n" +
+               "Rules:\n" +
+               "- matchScore: integer 0-100\n" +
+               "- matchedSkills: list every skill from resume that appears in JD\n" +
+               "- missingSkills: list every skill in JD not found in resume\n" +
+               "- improvements: exactly 3 specific actionable tips\n" +
+               "- verdict: must be exactly one of: Strong Match, Good Match, Needs Work, Poor Match\n" +
+               "- All keys and string values must use double quotes\n\n" +
+               "RESUME:\n" + resumeText + "\n\n" +
+               "JOB DESCRIPTION:\n" + jd;
+    }
+
+    private String buildFixPrompt(String resumeText, String jd,
+                                   List<String> missingSkills, List<String> improvements) {
+        String missing = String.join(", ", missingSkills);
+        String tips    = String.join("; ", improvements);
+
+        return "You are a professional resume writer. Rewrite the complete resume below to better match the job description.\n\n" +
+               "INSTRUCTIONS:\n" +
+               "- Incorporate these missing skills naturally where relevant: " + missing + "\n" +
+               "- Apply these improvements: " + tips + "\n" +
+               "- Keep ALL original sections (Summary, Skills, Experience, Projects, Education)\n" +
+               "- Keep the candidate's real experience — do not invent fake jobs or degrees\n" +
+               "- Use strong action verbs and add quantified results where possible\n" +
+               "- Output plain text only — no tables, no columns, no markdown\n\n" +
+               "You MUST respond with ONLY a JSON object. No explanation. No markdown. Start with { end with }.\n\n" +
+               "IMPORTANT: The fixedResumeText value contains the resume as a plain string. " +
+               "Resume section headers like 'Skills:', 'Experience:', 'Summary:' are part of the resume content, " +
+               "NOT JSON keys. Encode them as plain text inside the string value using \\n for line breaks.\n\n" +
+               "Use this EXACT structure:\n" +
+               "{\n" +
+               "  \"fixedResumeText\": \"Rahul Sharma\\nSoftware Engineer\\n\\nSUMMARY\\nYour rewritten summary here.\\n\\nTECHNICAL SKILLS\\nLanguages: Java, Python...\\n\\nEXPERIENCE\\nJob Title - Company (dates)\\n- Bullet point one\\n- Bullet point two\\n\\nPROJECTS\\nProject Name\\n- Description\\n\\nEDUCATION\\nDegree - University (year)\",\n" +
+               "  \"changesSummary\": \"One or two sentences describing what was changed.\"\n" +
+               "}\n\n" +
+               "Rules:\n" +
+               "- fixedResumeText must contain the COMPLETE rewritten resume — every section\n" +
+               "- Use \\n for line breaks inside the string value\n" +
+               "- Do NOT use colons followed by a newline at the top level of the JSON — only inside the string value\n" +
+               "- All keys and string values must use double quotes\n\n" +
+               "ORIGINAL RESUME:\n" + resumeText + "\n\n" +
+               "JOB DESCRIPTION:\n" + jd;
+    }
+
+    // ─── PARSERS ─────────────────────────────────────────────────────────────
+
+    private AnalysisResponse parseAnalysisResponse(String raw) throws Exception {
+        String text = extractJson(raw);
+        text = repairAnalysisJson(text);
+
+        JsonNode result;
+        try {
+            result = objectMapper.readTree(text);
+        } catch (Exception e) {
+            System.err.println("JSON parse failed after repair. Raw:\n" + raw);
+            return fallbackAnalysis(raw);
+        }
+
+        AnalysisResponse r = new AnalysisResponse();
+        r.setMatchScore(result.path("matchScore").asInt(60));
+        r.setSummary(result.path("summary").asText("Analysis complete. Please review the details below."));
+        r.setVerdict(normalizeVerdict(result.path("verdict").asText("Good Match")));
+
+        List<String> matched = new ArrayList<>();
+        result.path("matchedSkills").forEach(n -> {
+            for (String p : n.asText().split(",")) if (!p.trim().isEmpty()) matched.add(p.trim());
+        });
+        r.setMatchedSkills(matched);
+
+        List<String> missing = new ArrayList<>();
+        result.path("missingSkills").forEach(n -> {
+            for (String p : n.asText().split(",")) if (!p.trim().isEmpty()) missing.add(p.trim());
+        });
+        r.setMissingSkills(missing);
+
+        List<String> improvements = new ArrayList<>();
+        result.path("improvements").forEach(n -> improvements.add(n.asText()));
+        r.setImprovements(improvements);
+
+        return r;
+    }
+
+    private FixResponse parseFixResponse(String raw, String originalText) {
+        FixResponse r = new FixResponse();
+        try {
+            String text = extractJson(raw);
+
+            // FIX 4: For the fix response, do NOT run repairJson() — the aggressive
+            // unquoted-key regex fires on resume section headers like "Skills:" or
+            // "Summary:" that appear INSIDE the fixedResumeText string value and
+            // corrupts the JSON beyond recovery.
+            // Only apply the one safe cleanup: remove trailing commas.
+            text = text.replaceAll(",\\s*([}\\]])", "$1");
+
+            JsonNode result;
+            try {
+                result = objectMapper.readTree(text);
+            } catch (Exception jsonEx) {
+                // JSON still broken — try regex extraction directly from raw response
+                System.err.println("Fix JSON parse failed, attempting regex fallback. Error: " + jsonEx.getMessage());
+                String extracted = tryExtractResumeText(raw);
+                if (extracted.length() > 200) {
+                    r.setFixedResumeText(extracted);
+                    r.setChangesSummary("Resume has been optimized with missing skills and improvements applied.");
+                } else {
+                    r.setFixedResumeText(originalText);
+                    r.setChangesSummary("Could not generate full rewrite. Showing original resume — please try again.");
+                }
+                return r;
+            }
+
+            String fixed = result.path("fixedResumeText").asText("").trim();
+            // Convert escaped newlines to real newlines
+            fixed = fixed.replace("\\n", "\n").replace("\\t", "\t");
+
+            // FIX 5: Raised the minimum length check from 100 → 200 chars and also
+            // require at least one newline so a single garbled line doesn't pass.
+            boolean looksLikeResume = fixed.length() > 200 && fixed.contains("\n");
+            if (!looksLikeResume) {
+                r.setFixedResumeText(originalText);
+                r.setChangesSummary("Could not generate full rewrite. Showing original resume — please try again.");
+            } else {
+                r.setFixedResumeText(fixed);
+                r.setChangesSummary(result.path("changesSummary").asText("Resume has been optimized."));
+            }
+
+        } catch (Exception e) {
+            System.err.println("Fix parse failed: " + e.getMessage());
+            String fallback = tryExtractResumeText(raw);
+            r.setFixedResumeText(fallback.length() > 200 ? fallback : originalText);
+            r.setChangesSummary("Resume has been optimized with missing skills and improvements applied.");
+        }
+        return r;
+    }
+
+    // ─── JSON REPAIR ─────────────────────────────────────────────────────────
+
+    private String extractJson(String text) {
+        // Strip code fences
+        text = text.replaceAll("(?i)```json\\s*", "").replaceAll("```\\s*", "").trim();
+        // Find outermost braces
+        int start = text.indexOf('{');
+        int end   = text.lastIndexOf('}');
+        if (start != -1 && end != -1 && end > start) {
+            return text.substring(start, end + 1).trim();
+        }
+        return text.trim();
+    }
+
+    // FIX 6: Renamed from repairJson() to repairAnalysisJson() and scoped it
+    // ONLY to the analyze response. The analyze response contains simple arrays
+    // of short skill strings — no multi-line content — so the regex is safe there.
+    // It must NOT be applied to the fix response (see parseFixResponse above).
+    private String repairAnalysisJson(String text) {
+        // Fix _key= patterns (underscore then equals instead of colon)
+        text = text.replaceAll("_(\\w+)\\s*=\\s*", "\"$1\":");
+        // Fix unquoted keys: word: value → "word": value
+        text = text.replaceAll("(?<![\"\\w])(\\b[a-zA-Z][a-zA-Z0-9]*\\b)\\s*:", "\"$1\":");
+        // Fix doubled quotes from above ""key""
+        text = text.replaceAll("\"\"(\\w+)\"\"\\s*:", "\"$1\":");
+        // Fix verdict with pipe: "A|B" → "A"
+        text = text.replaceAll("\"(Strong Match|Good Match|Needs Work|Poor Match)\\|[^\"]*\"", "\"$1\"");
+        // Remove trailing commas
+        text = text.replaceAll(",\\s*([}\\]])", "$1");
+        return text;
+    }
+
+    private String normalizeVerdict(String raw) {
+        if (raw.contains("Strong")) return "Strong Match";
+        if (raw.contains("Good"))   return "Good Match";
+        if (raw.contains("Needs"))  return "Needs Work";
+        if (raw.contains("Poor"))   return "Poor Match";
+        return "Good Match";
+    }
+
+    private AnalysisResponse fallbackAnalysis(String raw) {
+        AnalysisResponse r = new AnalysisResponse();
+        Matcher score = Pattern.compile("matchScore[^0-9]*([0-9]+)").matcher(raw);
+        r.setMatchScore(score.find() ? Integer.parseInt(score.group(1)) : 60);
+        Matcher verdict = Pattern.compile("(Strong Match|Good Match|Needs Work|Poor Match)").matcher(raw);
+        r.setVerdict(verdict.find() ? verdict.group(1) : "Good Match");
+        r.setSummary("Analysis complete. The AI response had formatting issues — please retry for full details.");
+        r.setMatchedSkills(List.of("Retry for detailed skill breakdown"));
+        r.setMissingSkills(List.of("Retry for detailed skill breakdown"));
+        r.setImprovements(List.of(
+            "Retry the analysis for detailed improvement tips",
+            "Ensure your resume is in plain text format",
+            "Try pasting a shorter job description"
+        ));
+        return r;
+    }
+
+    private String tryExtractResumeText(String raw) {
+        // Try to find the fixedResumeText value using regex
+        Matcher m = Pattern.compile("\"fixedResumeText\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\""
+                                    , Pattern.DOTALL).matcher(raw);
+        if (m.find()) return m.group(1).replace("\\n", "\n").replace("\\\"", "\"");
+        // Strip all JSON syntax and return plain content
+        String plain = raw.replaceAll("(?i)```[a-z]*", "")
+                          .replaceAll("\"fixedResumeText\"\\s*:", "")
+                          .replaceAll("\"changesSummary\"\\s*:.*", "")
+                          .replaceAll("[{}]", "")
+                          .replaceAll("```", "")
+                          .trim();
+        return plain;
+    }
+}

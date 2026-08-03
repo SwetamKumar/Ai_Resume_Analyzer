@@ -1,0 +1,5 @@
+package com.resumeanalyzer.model;
+
+public class AnalysisRequest {
+
+}

@@ -1,0 +1,5 @@
+package com.resumeanalyzer.controller;
+
+public class ResumeController {
+
+}
